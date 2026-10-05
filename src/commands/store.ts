@@ -1,7 +1,7 @@
 import * as os from 'node:os';
 import { asErrorMessage, emitFailure, printJson } from './shared-output.js';
 import * as path from 'node:path';
-import { Command } from 'commander';
+import { Command, Option } from 'commander';
 
 import { COMMAND_REGISTRY } from '../core/completions/command-registry.js';
 
@@ -25,6 +25,7 @@ import {
   type StoreListResult,
   type StoreMutationResult,
   type SetupStoreInput,
+  type StorePathOptions,
 } from '../core/store/index.js';
 import { isInteractive } from '../utils/interactive.js';
 
@@ -39,15 +40,18 @@ interface StoreRegisterOptions {
   id?: string;
   yes?: boolean;
   json?: boolean;
+  scope?: string;
 }
 
 interface StoreRemoveOptions {
   yes?: boolean;
   json?: boolean;
+  scope?: string;
 }
 
 interface StoreJsonOptions {
   json?: boolean;
+  scope?: string;
 }
 
 interface ResolvedStoreSetupInput extends SetupStoreInput {
@@ -58,6 +62,8 @@ interface StoreOutput {
   id: string;
   root: string;
   metadata_path?: string;
+  /** For project-scoped entries, the directory containing the owning registry file. */
+  registry?: string;
 }
 
 interface StoreMutationOutput {
@@ -66,6 +72,7 @@ interface StoreMutationOutput {
     path: string;
     registered: boolean;
     already_registered: boolean;
+    scope: 'global' | 'project';
   } | null;
   git: {
     is_repository: boolean;
@@ -126,16 +133,18 @@ function toStoreOutput(store: StoreInfo): StoreOutput {
     id: store.id,
     root: store.root,
     ...(store.metadataPath ? { metadata_path: store.metadataPath } : {}),
+    ...(store.registryDir !== undefined ? { registry: store.registryDir } : {}),
   };
 }
 
-function toMutationOutput(result: StoreMutationResult): StoreMutationOutput {
+function toMutationOutput(result: StoreMutationResult, scope: 'global' | 'project' = 'global'): StoreMutationOutput {
   return {
     store: toStoreOutput(result.store),
     registry: {
       path: result.registryCommit.path,
       registered: result.registryCommit.registered,
       already_registered: result.registryCommit.alreadyRegistered,
+      scope,
     },
     git: {
       is_repository: result.git.isRepository,
@@ -427,6 +436,10 @@ function printCleanupHuman(title: string, payload: StoreCleanupOutput): void {
 
   console.log(`${title}: ${payload.store.id}`);
 
+  if (payload.registry?.path) {
+    console.log(`Registry updated: ${formatPathForHuman(payload.registry.path)}`);
+  }
+
   if (payload.files.deleted_path) {
     console.log(`Deleted: ${formatPathForHuman(payload.files.deleted_path)}`);
   } else if (payload.files.left_on_disk) {
@@ -450,11 +463,19 @@ function printListHuman(payload: StoreListOutput): void {
     return;
   }
 
+  const showRegistry = payload.stores.some((store) => store.registry !== undefined);
   console.log(`OpenSpec stores (${payload.stores.length})`);
   console.log('');
-  console.log(`${'ID'.padEnd(16)}Location`);
-  for (const store of payload.stores) {
-    console.log(`${store.id.padEnd(16)}${store.root}`);
+  if (showRegistry) {
+    console.log(`${'ID'.padEnd(16)}  Registry  Location`);
+    for (const store of payload.stores) {
+      console.log(`${store.id.padEnd(16)}  ${store.registry ?? ''}  ${store.root}`);
+    }
+  } else {
+    console.log(`${'ID'.padEnd(16)}  Location`);
+    for (const store of payload.stores) {
+      console.log(`${store.id.padEnd(16)}  ${store.root}`);
+    }
   }
 }
 
@@ -545,12 +566,16 @@ class StoreCommand {
 
   async register(inputPath: string | undefined, options: StoreRegisterOptions = {}): Promise<void> {
     try {
+      const scopeOptions: StorePathOptions = options.scope === 'project'
+        ? { projectRoot: process.cwd() }
+        : {};
       let result: StoreMutationResult;
       try {
         result = await registerExistingStore({
           path: inputPath,
           id: options.id,
           allowCreateIdentity: options.yes,
+          ...scopeOptions,
         });
       } catch (error) {
         if (!isRegisterIdentityConfirmationError(error) || options.json || !isInteractive()) {
@@ -562,17 +587,19 @@ class StoreCommand {
           path: inputPath,
           id: options.id,
           allowCreateIdentity: true,
+          ...scopeOptions,
         });
       }
 
-      const payload = toMutationOutput(result);
+      const scope: 'global' | 'project' = options.scope === 'project' ? 'project' : 'global';
+      const payload = toMutationOutput(result, scope);
 
       if (options.json) {
         printJson(payload);
         return;
       }
 
-      printMutationHuman('Store registered', payload, result.remotes);
+      printMutationHuman(scope === 'project' ? 'Store registered (project-scoped)' : 'Store registered', payload, result.remotes);
     } catch (error) {
       this.handleFailure(
         options.json,
@@ -584,7 +611,10 @@ class StoreCommand {
 
   async unregister(id: string, options: StoreJsonOptions = {}): Promise<void> {
     try {
-      const payload = toCleanupOutput(await unregisterStore({ id }));
+      const scopeOptions: StorePathOptions = options.scope === 'project'
+        ? { projectRoot: process.cwd() }
+        : {};
+      const payload = toCleanupOutput(await unregisterStore({ id, ...scopeOptions }));
 
       if (options.json) {
         printJson(payload);
@@ -603,7 +633,10 @@ class StoreCommand {
 
   async remove(id: string, options: StoreRemoveOptions = {}): Promise<void> {
     try {
-      const target = await prepareStoreCleanup({ id });
+      const scopeOptions: StorePathOptions = options.scope === 'project'
+        ? { projectRoot: process.cwd() }
+        : {};
+      const target = await prepareStoreCleanup({ id, ...scopeOptions });
       await confirmRemove(target.id, target.root, options);
       const payload = toCleanupOutput(await removeStore(target));
 
@@ -624,7 +657,10 @@ class StoreCommand {
 
   async list(options: StoreJsonOptions = {}): Promise<void> {
     try {
-      const payload = toListOutput(await listStores());
+      const scopeOptions: StorePathOptions = options.scope === 'project'
+        ? { projectRoot: process.cwd() }
+        : {};
+      const payload = toListOutput(await listStores(scopeOptions));
 
       if (options.json) {
         printJson(payload);
@@ -639,7 +675,10 @@ class StoreCommand {
 
   async doctor(id: string | undefined, options: StoreJsonOptions = {}): Promise<void> {
     try {
-      const payload = toDoctorOutput(await doctorStores(id));
+      const scopeOptions: StorePathOptions = options.scope === 'project'
+        ? { projectRoot: process.cwd() }
+        : {};
+      const payload = toDoctorOutput(await doctorStores(id, scopeOptions));
 
       if (options.json) {
         printJson(payload);
@@ -687,6 +726,7 @@ export function registerStoreCommand(program: Command): void {
     .description('Register an existing local store')
     .option('--id <id>', 'Store id; defaults to metadata or folder name')
     .option('--yes', 'Confirm creating store identity metadata for a healthy OpenSpec root')
+    .addOption(new Option('--scope <scope>', 'Registry scope: "project" for project-scoped, default is global').choices(['project', 'global']))
     .option('--json', 'Output as JSON')
     .action(async (inputPath: string | undefined, options: StoreRegisterOptions) => {
       await storeCommand.register(inputPath, options);
@@ -695,6 +735,7 @@ export function registerStoreCommand(program: Command): void {
   store
     .command('unregister <id>')
     .description('Forget a local store registration without deleting files')
+    .addOption(new Option('--scope <scope>', 'Registry scope: "project" for project-scoped, default is global').choices(['project', 'global']))
     .option('--json', 'Output as JSON')
     .action(async (id: string, options: StoreJsonOptions) => {
       await storeCommand.unregister(id, options);
@@ -704,6 +745,7 @@ export function registerStoreCommand(program: Command): void {
     .command('remove <id>')
     .description('Forget a local store registration and delete its local folder')
     .option('--yes', 'Confirm local store folder deletion')
+    .addOption(new Option('--scope <scope>', 'Registry scope: "project" for project-scoped, default is global').choices(['project', 'global']))
     .option('--json', 'Output as JSON')
     .action(async (id: string, options: StoreRemoveOptions) => {
       await storeCommand.remove(id, options);
@@ -713,6 +755,7 @@ export function registerStoreCommand(program: Command): void {
     .command('list')
     .alias('ls')
     .description('List locally registered stores')
+    .addOption(new Option('--scope <scope>', 'Registry scope: "project" for project-scoped, default is global').choices(['project', 'global']))
     .option('--json', 'Output as JSON')
     .action(async (options: StoreJsonOptions) => {
       await storeCommand.list(options);
@@ -721,6 +764,7 @@ export function registerStoreCommand(program: Command): void {
   store
     .command('doctor [id]')
     .description('Check local store registration and metadata')
+    .addOption(new Option('--scope <scope>', 'Registry scope: "project" for project-scoped, default is global').choices(['project', 'global']))
     .option('--json', 'Output as JSON')
     .action(async (id: string | undefined, options: StoreJsonOptions) => {
       await storeCommand.doctor(id, options);

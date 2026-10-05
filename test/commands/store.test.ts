@@ -151,6 +151,7 @@ describe('store command', () => {
       path: expect.any(String),
       registered: true,
       already_registered: false,
+      scope: 'global',
     });
     expect(payload.created_files).toEqual([
       'openspec/',
@@ -1306,6 +1307,297 @@ describe('store command', () => {
       expect(result.stdout).toContain('Create and manage stores - standalone');
       expect(result.stdout).not.toContain(RETIRED_GROUP);
     });
+  });
+
+  describe('register --scope project', () => {
+    it('writes to project-scoped registry and reports scope: project in JSON output', async () => {
+      const storeRoot = mkdir('platform-specs');
+      createHealthyOpenSpecRoot(storeRoot);
+
+      const result = await runCLI(
+        ['store', 'register', storeRoot, '--yes', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe('');
+      const payload = parseJson(result);
+      expect(payload.registry).toEqual({
+        path: expect.any(String),
+        registered: true,
+        already_registered: false,
+        scope: 'project',
+      });
+
+      const registryPath = path.join(tempDir, '.openspec-store', 'registry.yaml');
+      expect(fs.existsSync(registryPath)).toBe(true);
+      const registryContent = fs.readFileSync(registryPath, 'utf-8');
+      expect(registryContent).toContain('platform-specs:');
+      expect(registryContent).not.toContain('backend:');
+    });
+
+    it('rejects store path outside project root with --scope project', async () => {
+      const outsideRoot = fs.mkdtempSync(path.join(os.tmpdir(), 'outside-'));
+      createHealthyOpenSpecRoot(outsideRoot);
+
+      const result = await runCLI(
+        ['store', 'register', outsideRoot, '--id', 'outside-specs', '--yes', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(1);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.status[0].code).toBe('store_path_outside_project');
+
+      // No project-scoped registry entry is created by the rejected registration.
+      const cwdRegistry = path.join(tempDir, '.openspec-store', 'registry.yaml');
+      const outsideRegistry = path.join(outsideRoot, '.openspec-store', 'registry.yaml');
+      expect(fs.existsSync(cwdRegistry)).toBe(false);
+      expect(fs.existsSync(outsideRegistry)).toBe(false);
+    });
+  });
+
+  describe('project-scoped registry warnings', () => {
+    it('store setup does not write a project-scoped registry', async () => {
+      const storeRoot = path.join(tempDir, 'setup-store');
+
+      const result = await runCLI(
+        ['store', 'setup', 'setup-store', '--path', storeRoot, '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+
+      const cwdRegistry = path.join(tempDir, '.openspec-store', 'registry.yaml');
+      const storeRegistry = path.join(storeRoot, '.openspec-store', 'registry.yaml');
+      expect(fs.existsSync(cwdRegistry)).toBe(false);
+      expect(fs.existsSync(storeRegistry)).toBe(false);
+    });
+
+    it('warns on stderr and continues the walk when a registry in the chain is malformed', async () => {
+      const nested = path.join(tempDir, 'nested');
+      fs.mkdirSync(nested, { recursive: true });
+      fs.mkdirSync(path.join(tempDir, '.openspec-store'), { recursive: true });
+      fs.writeFileSync(
+        path.join(tempDir, '.openspec-store', 'registry.yaml'),
+        'not: [valid'
+      );
+
+      const result = await runCLI(
+        ['store', 'list', '--scope', 'project', '--json'],
+        { cwd: nested, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toContain('malformed');
+      const payload = parseJson(result);
+      expect(payload.stores).toEqual([]);
+    });
+  });
+
+  describe('list --scope project', () => {
+    it('lists stores from project-scoped registry', async () => {
+      const storeRoot = mkdir('platform-specs');
+      createHealthyOpenSpecRoot(storeRoot);
+
+      await runCLI(
+        ['store', 'register', storeRoot, '--yes', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      const result = await runCLI(
+        ['store', 'list', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.stores).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: 'platform-specs' }),
+        ])
+      );
+    });
+  });
+
+  describe('unregister --scope project', () => {
+    it('removes a store from the project-scoped registry', async () => {
+      const storeRoot = mkdir('platform-specs');
+      createHealthyOpenSpecRoot(storeRoot);
+
+      await runCLI(
+        ['store', 'register', storeRoot, '--yes', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      const registryPath = path.join(tempDir, '.openspec-store', 'registry.yaml');
+      expect(fs.existsSync(registryPath)).toBe(true);
+
+      const result = await runCLI(
+        ['store', 'unregister', 'platform-specs', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe('');
+      const payload = JSON.parse(result.stdout);
+      expect(payload.store).toEqual(
+        expect.objectContaining({ id: 'platform-specs' })
+      );
+
+      const remaining = fs.readFileSync(registryPath, 'utf-8');
+      expect(remaining).not.toContain('platform-specs');
+    });
+  });
+
+  describe('doctor --scope project', () => {
+    it('inspects a project-scoped store and reports health', async () => {
+      const storeRoot = mkdir('platform-specs');
+      createHealthyOpenSpecRoot(storeRoot);
+
+      await runCLI(
+        ['store', 'register', storeRoot, '--yes', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      const result = await runCLI(
+        ['store', 'doctor', 'platform-specs', '--scope', 'project', '--json'],
+        { cwd: tempDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stderr).toBe('');
+      const payload = JSON.parse(result.stdout);
+      expect(payload.stores).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({ id: 'platform-specs' }),
+        ])
+      );
+    });
+  });
+
+  describe('project-scoped registry discovery walk (CLI)', () => {
+    let monorepoDir: string;
+    let nestedDir: string;
+
+    beforeEach(async () => {
+      monorepoDir = mkdir('walkspace/monorepo');
+      const storeRoot = path.join(monorepoDir, 'platform-specs');
+      fs.mkdirSync(storeRoot, { recursive: true });
+      createHealthyOpenSpecRoot(storeRoot);
+      nestedDir = path.join(monorepoDir, 'apps', 'api');
+      fs.mkdirSync(nestedDir, { recursive: true });
+
+      const registerResult = await runCLI(
+        ['store', 'register', storeRoot, '--yes', '--scope', 'project', '--json'],
+        { cwd: monorepoDir, env }
+      );
+      expect(registerResult.exitCode).toBe(0);
+    });
+
+    it('list from a nested directory shows ancestor registries with the owning directory', async () => {
+      const result = await runCLI(
+        ['store', 'list', '--scope', 'project', '--json'],
+        { cwd: nestedDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.stores).toEqual([
+        expect.objectContaining({
+          id: 'platform-specs',
+          registry: expect.stringContaining('walkspace/monorepo'),
+        }),
+      ]);
+    });
+
+    it('unregister from a nested directory removes the entry from the ancestor registry', async () => {
+      const result = await runCLI(
+        ['store', 'unregister', 'platform-specs', '--scope', 'project', '--json'],
+        { cwd: nestedDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.store).toEqual(
+        expect.objectContaining({ id: 'platform-specs' })
+      );
+
+      const registryPath = path.join(monorepoDir, '.openspec-store', 'registry.yaml');
+      expect(fs.readFileSync(registryPath, 'utf-8')).not.toContain('platform-specs');
+    });
+
+    it('doctor from a nested directory inspects the ancestor registry entry', async () => {
+      const result = await runCLI(
+        ['store', 'doctor', 'platform-specs', '--scope', 'project', '--json'],
+        { cwd: nestedDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.stores).toEqual([
+        expect.objectContaining({ id: 'platform-specs' }),
+      ]);
+    });
+
+    it('remove --scope project still requires explicit confirmation', async () => {
+      const storeRoot = path.join(monorepoDir, 'platform-specs');
+
+      const result = await runCLI(
+        ['store', 'remove', 'platform-specs', '--scope', 'project', '--json'],
+        { cwd: nestedDir, env }
+      );
+
+      expect(result.exitCode).toBe(1);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.status[0]).toEqual(
+        expect.objectContaining({
+          code: 'store_remove_confirmation_required',
+        })
+      );
+      expect(fs.existsSync(storeRoot)).toBe(true);
+    });
+
+    it('remove --scope project from a nested directory deletes the folder and the ancestor binding', async () => {
+      const storeRoot = path.join(monorepoDir, 'platform-specs');
+
+      const result = await runCLI(
+        ['store', 'remove', 'platform-specs', '--scope', 'project', '--yes', '--json'],
+        { cwd: nestedDir, env }
+      );
+
+      expect(result.exitCode).toBe(0);
+      const payload = JSON.parse(result.stdout);
+      expect(payload.files).toEqual(expect.objectContaining({ deleted: true }));
+      expect(payload.registry).toEqual(
+        expect.objectContaining({
+          removed: true,
+          path: expectedExistingPath(path.join(monorepoDir, '.openspec-store', 'registry.yaml')),
+        })
+      );
+      expect(fs.existsSync(storeRoot)).toBe(false);
+
+      const registryPath = path.join(monorepoDir, '.openspec-store', 'registry.yaml');
+      expect(fs.readFileSync(registryPath, 'utf-8')).not.toContain('platform-specs');
+    });
+
+    it('human list shows the owning registry directory for project-scoped entries', async () => {
+      const result = await runCLI(['store', 'list', '--scope', 'project'], {
+        cwd: nestedDir,
+        env,
+      });
+
+      expect(result.exitCode).toBe(0);
+      expect(result.stdout).toContain('Registry');
+      expect(result.stdout).toContain(path.join(monorepoDir, 'platform-specs'));
+    });
+  });
+
+  it('rejects an unknown --scope value instead of treating it as global', async () => {
+    const result = await runCLI(['store', 'list', '--scope', 'garbage'], { env });
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toContain('--scope');
   });
 
 });

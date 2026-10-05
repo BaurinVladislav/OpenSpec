@@ -26,10 +26,14 @@ import {
   getStoreRegistryPath,
   listStoreRegistryEntries,
   readStoreRegistryState,
+  readProjectStoreRegistryState,
+  listProjectStoreRegistryEntries,
+  walkProjectStoreRegistries,
   readOptionalStoreMetadataState,
   resolveGitStoreBackendConfig,
   validateStoreId,
   writeStoreMetadataState,
+  normalizePathForComparison,
   type StoreGitBackendConfig,
   type StorePathOptions,
   type StoreRegistryState,
@@ -65,6 +69,8 @@ export interface StoreInfo {
   id: string;
   root: string;
   metadataPath?: string;
+  /** For project-scoped entries, the directory containing the owning registry file. */
+  registryDir?: string;
 }
 
 export interface StoreMutationResult {
@@ -140,7 +146,7 @@ export interface SetupStoreInput {
   remote?: string;
 }
 
-export interface RegisterExistingStoreInput {
+export interface RegisterExistingStoreInput extends StorePathOptions {
   path?: string;
   id?: string;
   allowCreateIdentity?: boolean;
@@ -401,7 +407,8 @@ function mutationPayload(
   createdFiles: string[],
   registry: { registered: boolean; alreadyRegistered: boolean },
   diagnostics: StoreDiagnostic[] = [],
-  remotes?: { canonical?: string; observed?: string }
+  remotes?: { canonical?: string; observed?: string },
+  scopeOptions: StorePathOptions = {}
 ): StoreMutationResult {
   return {
     store: {
@@ -411,7 +418,7 @@ function mutationPayload(
     },
     ...(remotes && (remotes.canonical || remotes.observed) ? { remotes } : {}),
     registryCommit: {
-      path: getStoreRegistryPath(),
+      path: getStoreRegistryPath(scopeOptions),
       registered: registry.registered,
       alreadyRegistered: registry.alreadyRegistered,
     },
@@ -794,13 +801,32 @@ export async function registerExistingStore(
   if (metadata && explicitId !== undefined && metadata.id !== explicitId) {
     // The fix must account for whether the metadata id is already registered,
     // so following it never lands on the already-registered error.
+    if (input.projectRoot !== undefined) {
+      const projectRegistry = await readProjectStoreRegistryState(input.projectRoot);
+      const projectEntries = projectRegistry ? listProjectStoreRegistryEntries(projectRegistry, input.projectRoot) : [];
+      const existingEntry = projectEntries.find((e) => e.id === metadata.id);
+      const registeredElsewhere = existingEntry !== undefined &&
+        normalizePathForComparison(existingEntry.storeRoot) !== normalizePathForComparison(storeRoot);
+
+      throw new StoreError(
+        `Store metadata id '${metadata.id}' does not match --id '${explicitId}'. The id comes from the store's .openspec-store/store.yaml.`,
+        'store_metadata_id_mismatch',
+        {
+          target: 'store.id',
+          fix: registeredElsewhere
+            ? `One checkout per store id is supported, and '${metadata.id}' is already registered. Run openspec store unregister ${metadata.id} --scope project first to register this checkout instead.`
+            : `Use --id ${metadata.id} or register a different folder.`,
+        }
+      );
+    }
+
     const currentRegistry = await readStoreRegistryState();
     const registeredElsewhere =
       currentRegistry?.stores?.[metadata.id] !== undefined &&
       !isRegisteredAtPath(currentRegistry, metadata.id, storeRoot);
 
     throw new StoreError(
-      `Store metadata id '${metadata.id}' does not match --id '${explicitId}'. The id comes from the store's committed .openspec-store/store.yaml.`,
+      `Store metadata id '${metadata.id}' does not match --id '${explicitId}'. The id comes from the store's .openspec-store/store.yaml.`,
       'store_metadata_id_mismatch',
       {
         target: 'store.id',
@@ -824,8 +850,29 @@ export async function registerExistingStore(
   }
 
   const backend = await resolveBackendWithObservedOrigin(storeRoot);
-  const registry = await readStoreRegistryState();
-  assertNoRegisteredStoreConflict(registry, id, backend);
+  const scopeOptions = input.projectRoot !== undefined ? { projectRoot: input.projectRoot } : {};
+  // When projectRoot is set, conflict-check against the project-scoped registry
+  // (which uses { path: ... } format), not the global { backend: ... } registry.
+  if (input.projectRoot !== undefined) {
+    const projectRegistry = await readProjectStoreRegistryState(input.projectRoot);
+    if (projectRegistry) {
+      const projectEntries = listProjectStoreRegistryEntries(projectRegistry, input.projectRoot);
+      const existingEntry = projectEntries.find((e) => e.id === id);
+      if (existingEntry && normalizePathForComparison(existingEntry.storeRoot) !== normalizePathForComparison(storeRoot)) {
+        throw new StoreError(
+          `Store '${id}' is already registered at ${existingEntry.storeRoot} in the project-scoped registry.`,
+          'store_id_conflict',
+          {
+            target: 'store.id',
+            fix: `Use the existing registration, or run openspec store unregister ${id} --scope project first.`,
+          }
+        );
+      }
+    }
+  } else {
+    const registry = await readStoreRegistryState();
+    assertNoRegisteredStoreConflict(registry, id, backend);
+  }
   const createdFiles: string[] = [];
   const isRepository = await isGitRepositoryAtRoot(storeRoot);
 
@@ -833,6 +880,7 @@ export async function registerExistingStore(
     id,
     backend,
     writeMetadataIfMissing: true,
+    ...scopeOptions,
   });
   if (registered.metadataCreated) {
     createdFiles.push('.openspec-store/store.yaml');
@@ -852,7 +900,7 @@ export async function registerExistingStore(
   }, diagnostics, {
     ...(metadata?.remote ? { canonical: metadata.remote } : {}),
     ...(backend.remote ? { observed: backend.remote } : {}),
-  });
+  }, scopeOptions);
 }
 
 function cleanupStoreOutput(id: string, storeRoot: string): StoreInfo {
@@ -870,12 +918,14 @@ export async function prepareStoreCleanup(
   const entry = await getRegisteredStore({
     id,
     globalDataDir: input.globalDataDir,
+    ...(input.projectRoot !== undefined ? { projectRoot: input.projectRoot } : {}),
   });
 
   return {
     ...cleanupStoreOutput(entry.id, entry.storeRoot),
     backend: entry.backend,
     ...(input.globalDataDir ? { globalDataDir: input.globalDataDir } : {}),
+    ...(input.projectRoot !== undefined ? { projectRoot: input.projectRoot } : {}),
   };
 }
 
@@ -887,12 +937,15 @@ export async function unregisterStore(
     id: target.id,
     expectedBackend: target.backend,
     globalDataDir: target.globalDataDir,
+    ...(input.projectRoot !== undefined ? { projectRoot: input.projectRoot } : {}),
   });
 
   return {
     store: cleanupStoreOutput(removed.id, removed.storeRoot),
     registryCommit: {
-      path: getStoreRegistryPath({ globalDataDir: target.globalDataDir }),
+      path: removed.registryDir
+        ? getStoreRegistryPath({ projectRoot: removed.registryDir })
+        : getStoreRegistryPath({ globalDataDir: target.globalDataDir }),
       removed: true,
     },
     files: {
@@ -998,6 +1051,7 @@ export async function removeStore(
     id,
     expectedBackend: target.backend,
     globalDataDir: target.globalDataDir,
+    ...(target.projectRoot !== undefined ? { projectRoot: target.projectRoot } : {}),
     beforeCommit: async (entry, remaining) => {
       const safeTarget = await assertSafeToDeleteStoreRoot(entry.storeRoot, id);
       rootMissing = !safeTarget.exists;
@@ -1036,7 +1090,9 @@ export async function removeStore(
   return {
     store: cleanupStoreOutput(removed.id, removed.storeRoot),
     registryCommit: {
-      path: getStoreRegistryPath({ globalDataDir: target.globalDataDir }),
+      path: removed.registryDir
+        ? getStoreRegistryPath({ projectRoot: removed.registryDir })
+        : getStoreRegistryPath({ globalDataDir: target.globalDataDir }),
       removed: true,
     },
     files: {
@@ -1047,13 +1103,14 @@ export async function removeStore(
   };
 }
 
-export async function listStores(): Promise<StoreListResult> {
-  const entries = await listRegisteredStores();
+export async function listStores(options: StorePathOptions = {}): Promise<StoreListResult> {
+  const entries = await listRegisteredStores(options);
 
   return {
     stores: entries.map((entry) => ({
       id: entry.id,
       root: entry.storeRoot,
+      ...(entry.registryDir !== undefined ? { registryDir: entry.registryDir } : {}),
     })),
   };
 }
@@ -1229,22 +1286,42 @@ async function inspectStore(entry: {
   };
 }
 
-export async function doctorStores(id?: string): Promise<StoreDoctorResult> {
+export async function doctorStores(id?: string, options: StorePathOptions = {}): Promise<StoreDoctorResult> {
   const selectedId = id !== undefined ? validateStoreId(id) : undefined;
-  const registry = await readStoreRegistryState();
 
-  if (!registry) {
-    if (selectedId !== undefined) {
-      throw new StoreError(`Unknown store '${selectedId}'.`, 'store_not_found', {
-        target: 'store.id',
-        fix: 'Run openspec store list to see registered stores.',
-      });
+  let entries: Array<{ id: string; backend: StoreGitBackendConfig }>;
+  if (options.projectRoot !== undefined) {
+    const levels = await walkProjectStoreRegistries(options.projectRoot);
+    const projectEntries = levels.flatMap((level) =>
+      listProjectStoreRegistryEntries(level.state, level.registryDir).map((e) => ({
+        id: e.id,
+        backend: { type: 'git' as const, local_path: e.storeRoot },
+      }))
+    );
+    if (projectEntries.length === 0) {
+      if (selectedId !== undefined) {
+        throw new StoreError(`Unknown store '${selectedId}'.`, 'store_not_found', {
+          target: 'store.id',
+          fix: 'Run openspec store list --scope project to see registered stores.',
+        });
+      }
+      return { stores: [], diagnostics: [] };
     }
-
-    return { stores: [], diagnostics: [] };
+    entries = projectEntries;
+  } else {
+    const registry = await readStoreRegistryState();
+    if (!registry) {
+      if (selectedId !== undefined) {
+        throw new StoreError(`Unknown store '${selectedId}'.`, 'store_not_found', {
+          target: 'store.id',
+          fix: 'Run openspec store list to see registered stores.',
+        });
+      }
+      return { stores: [], diagnostics: [] };
+    }
+    entries = listStoreRegistryEntries(registry);
   }
 
-  const entries = listStoreRegistryEntries(registry);
   const selected = selectedId
     ? entries.filter((entry) => entry.id === selectedId)
     : entries;
@@ -1252,7 +1329,10 @@ export async function doctorStores(id?: string): Promise<StoreDoctorResult> {
   if (selectedId && selected.length === 0) {
     throw new StoreError(`Unknown store '${selectedId}'.`, 'store_not_found', {
       target: 'store.id',
-      fix: 'Run openspec store list to see registered stores.',
+      fix:
+        options.projectRoot !== undefined
+          ? 'Run openspec store list --scope project to see registered stores.'
+          : 'Run openspec store list to see registered stores.',
     });
   }
 

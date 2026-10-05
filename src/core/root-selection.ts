@@ -32,6 +32,10 @@ import {
   readStoreRegistryState,
   readOptionalStoreMetadataState,
   validateStoreId,
+  findProjectRegistryDir,
+  findProjectStoreById,
+  listProjectStoreRegistryEntries,
+  walkProjectStoreRegistries,
 } from './store/foundation.js';
 import { getStoreRootForBackend } from './store/registry.js';
 import { inspectOpenSpecRoot } from './openspec-root.js';
@@ -42,6 +46,7 @@ import { FileSystemUtils } from '../utils/file-system.js';
 
 export type OpenSpecRootSource =
   | 'store'
+  | 'project_store'
   | 'declared'
   | 'global_default'
   | 'nearest'
@@ -224,6 +229,118 @@ async function resolveStoreRoot(
 }
 
 /**
+ * Maps a store inspection result to a resolved root or throws.
+ * Shared between project-scoped and global resolution paths.
+ */
+function resolveFromInspection(
+  id: string,
+  storeRoot: string,
+  inspection: RegisteredStoreInspection,
+  source: OpenSpecRootSource
+): ResolvedOpenSpecRoot {
+  switch (inspection.kind) {
+    case 'ok':
+      return makeRoot(inspection.canonicalRoot, source, id);
+    case 'metadata_error':
+      return fromStoreError(inspection.error);
+    case 'metadata_missing':
+      throw new RootSelectionError(
+        `Store '${id}' is missing identity metadata at ${inspection.metadataPath}. ${doctorFix(id)}`,
+        'store_identity_mismatch',
+        { target: 'store.metadata', fix: doctorFix(id) }
+      );
+    case 'metadata_id_mismatch':
+      throw new RootSelectionError(
+        `Store '${id}' metadata id '${inspection.actualId}' does not match its registered id. ${doctorFix(id)}`,
+        'store_identity_mismatch',
+        { target: 'store.metadata', fix: doctorFix(id) }
+      );
+    case 'unhealthy_root':
+      throw new RootSelectionError(
+        `Store '${id}' does not have a healthy OpenSpec root at ${storeRoot}: ${inspection.problems} ${doctorFix(id)}`,
+        'unhealthy_store_root',
+        { target: 'openspec.root', fix: doctorFix(id) }
+      );
+  }
+}
+
+/**
+ * Resolves a store ID by walking up project-scoped registries (D4 Variant C),
+ * then falling back to the global registry.
+ * When a store ID is found in a project-scoped registry, `source: 'project_store'`
+ * is used. When found only in the global registry, the caller-provided `source`
+ * is used (defaults to `'store'`).
+ */
+async function resolveMergedStoreRoot(
+  id: string,
+  startPath: string,
+  globalDataDir?: string,
+  source: OpenSpecRootSource = 'store'
+): Promise<ResolvedOpenSpecRoot> {
+  try {
+    validateStoreId(id);
+  } catch (error) {
+    fromStoreError(error);
+  }
+
+  // Walk up checking each .openspec-store/registry.yaml for the ID (D4 Variant C).
+  const projectLookup = await findProjectStoreById(id, startPath);
+  if (projectLookup.found) {
+    const inspection = await inspectRegisteredStore(id, projectLookup.found.storeRoot);
+    return resolveFromInspection(id, projectLookup.found.storeRoot, inspection, 'project_store');
+  }
+
+  // Fall back to global registry.
+  let globalRegistry;
+  try {
+    globalRegistry = await readStoreRegistryState(globalDataDir ? { globalDataDir } : {});
+  } catch (error) {
+    fromStoreError(error);
+  }
+  const globalEntries = globalRegistry ? listStoreRegistryEntries(globalRegistry) : [];
+  const globalEntry = globalEntries.find((candidate) => candidate.id === id);
+
+  if (globalEntry) {
+    const storeRoot = getStoreRootForBackend(globalEntry.backend);
+    const inspection = await inspectRegisteredStore(id, storeRoot);
+    return resolveFromInspection(id, storeRoot, inspection, source);
+  }
+
+  // Not found in either registry. "No stores are registered" is only true
+  // when no project-scoped registry had entries either.
+  if (globalEntries.length === 0) {
+    if (!projectLookup.projectStoresExist) {
+      throw new RootSelectionError(
+        `Unknown store '${id}'. No stores are registered.`,
+        'no_registered_stores',
+        {
+          target: 'store.id',
+          fix: `Run openspec store setup ${id} or openspec store register <path> first.`,
+        }
+      );
+    }
+
+    throw new RootSelectionError(
+      `Unknown store '${id}'. No project-scoped or global registry registers it.`,
+      'unknown_store',
+      {
+        target: 'store.id',
+        fix: 'Pass a registered store id, or run openspec store list.',
+      }
+    );
+  }
+
+  throw new RootSelectionError(
+    `Unknown store '${id}'. Registered stores: ${globalEntries.map((e) => e.id).join(', ')}.`,
+    'unknown_store',
+    {
+      target: 'store.id',
+      fix: 'Pass a registered store id, or run openspec store list.',
+    }
+  );
+}
+
+/**
  * The metadata-identity and root-health stages of registered-store
  * resolution, as a non-throwing result. `resolveStoreRoot` maps each
  * failure kind to its established error; the reference index assembler
@@ -332,7 +449,7 @@ async function resolveNearestOrDeclaredRoot(
   }
 
   try {
-    return await resolveStoreRoot(pointer.value, globalDataDir, 'declared');
+    return await resolveMergedStoreRoot(pointer.value, nearestRoot, globalDataDir, 'declared');
   } catch (error) {
     if (error instanceof RootSelectionError) {
       // Rewrap with the declaration origin. The unknown-store fix is
@@ -404,13 +521,34 @@ export async function resolveOpenSpecRoot(
   }
 
   if (options.store !== undefined) {
-    return resolveStoreRoot(options.store, options.globalDataDir);
+    const storeStartPath = options.startPath ?? process.cwd();
+    return resolveMergedStoreRoot(options.store, storeStartPath, options.globalDataDir);
   }
 
   const startPath = options.startPath ?? process.cwd();
   const nearestRoot = findQualifyingRootSync(startPath);
   if (nearestRoot) {
     return resolveNearestOrDeclaredRoot(nearestRoot, options.globalDataDir);
+  }
+
+  // Project-scoped registry discovery: if a project-scoped registry exists
+  // but no nearest root was found, try to resolve any store from the merged
+  // registry before falling back to the global defaultStore.
+  // When no registry is found, the chain continues to defaultStore.
+  // The walk mirrors resolution semantics: malformed levels are skipped with
+  // a warning, and the first usable store entry in document order is taken,
+  // nearest registry first.
+  const discoveryProjectRoot = findProjectRegistryDir(startPath);
+  if (discoveryProjectRoot) {
+    const levels = await walkProjectStoreRegistries(startPath);
+    for (const level of levels) {
+      for (const entry of listProjectStoreRegistryEntries(level.state, level.registryDir)) {
+        const inspection = await inspectRegisteredStore(entry.id, entry.storeRoot);
+        if (inspection.kind === 'ok') {
+          return makeRoot(inspection.canonicalRoot, 'project_store', entry.id);
+        }
+      }
+    }
   }
 
   // Machine-level fallback: a global defaultStore is consulted only after
