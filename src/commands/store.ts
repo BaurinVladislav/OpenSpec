@@ -29,27 +29,27 @@ import {
 } from '../core/store/index.js';
 import { isInteractive } from '../utils/interactive.js';
 
-interface StoreSetupOptions {
+export interface StoreSetupOptions {
   path?: string;
   initGit?: boolean;
   json?: boolean;
   remote?: string;
 }
 
-interface StoreRegisterOptions {
+export interface StoreRegisterOptions {
   id?: string;
   yes?: boolean;
   json?: boolean;
   scope?: string;
 }
 
-interface StoreRemoveOptions {
+export interface StoreRemoveOptions {
   yes?: boolean;
   json?: boolean;
   scope?: string;
 }
 
-interface StoreJsonOptions {
+export interface StoreJsonOptions {
   json?: boolean;
   scope?: string;
 }
@@ -537,7 +537,7 @@ function printDoctorHuman(payload: StoreDoctorOutput): void {
   }
 }
 
-class StoreCommand {
+export class StoreCommand {
   async setup(id: string | undefined, options: StoreSetupOptions = {}): Promise<void> {
     try {
       const setupInput = await resolveSetupInput(id, options);

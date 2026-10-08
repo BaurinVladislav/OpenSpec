@@ -11,7 +11,7 @@ The system SHALL discover and resolve store IDs by walking up from the current w
 #### Scenario: Store resolved from project-scoped registry
 - **WHEN** a project contains `.openspec-store/registry.yaml` mapping a store ID to a relative path
 - **AND** the user runs a command with `--store <id>` from within that project
-- **THEN** the system resolves the store to the path relative to the registry file's directory
+- **THEN** the system resolves the store to the path relative to the directory containing `.openspec-store/`
 - **AND** no global registry registration is required
 - **AND** in JSON output, sets `source` to `'project_store'`
 
@@ -76,15 +76,14 @@ The system SHALL discover and resolve store IDs by walking up from the current w
 - **WHEN** `.openspec-store/registry.yaml` exists and contains at least one store entry
 - **AND** no `--store` flag is provided
 - **AND** no `openspec/` root is found by walking up from the current directory
-- **THEN** the system resolves the first usable store entry in document order along the chain of `.openspec-store/registry.yaml` files (nearest registry first, entries in the order they are written in each file) as the root
+- **THEN** the system resolves the first store entry in document order from the nearest `.openspec-store/registry.yaml` as the root
 - **AND** in JSON output, sets `source` to `'project_store'`
 
-#### Scenario: Discovery skips an unusable store entry with a warning
+#### Scenario: Discovery reports an error when the first store entry is unusable
 - **WHEN** no `--store` flag is provided and no local `openspec/` root exists
 - **AND** the first store entry in document order points to a folder that does not exist
-- **AND** a subsequent entry points to a valid store
-- **THEN** the system reports a warning that the first entry is unusable
-- **AND** resolves the default root from the next usable entry
+- **THEN** the system reports an error that the store folder is missing
+- **AND** does not continue to the next entry
 
 #### Scenario: Store setup does not write a project-scoped registry
 - **WHEN** the user runs `openspec store setup <id>`
@@ -93,7 +92,7 @@ The system SHALL discover and resolve store IDs by walking up from the current w
 
 ### Requirement: Relative path resolution in project-scoped registry
 
-The system SHALL resolve store paths in a project-scoped registry relative to the directory containing the registry file, using platform-appropriate path joining.
+The system SHALL resolve store paths in a project-scoped registry relative to the directory containing `.openspec-store/`, using platform-appropriate path joining.
 
 #### Scenario: Relative path resolved from registry directory
 - **WHEN** `.openspec-store/registry.yaml` at `/project/` maps a store ID to path `store-a`
@@ -108,15 +107,14 @@ The system SHALL resolve store paths in a project-scoped registry relative to th
 - **AND** the store path is `specs`
 - **THEN** the system resolves the store root using platform-appropriate path separators (`C:\project\specs`)
 
-#### Scenario: Store path outside project root
-- **WHEN** the user runs `openspec store register <path> --scope project`
-- **AND** the store path resolves to a location outside the project root
-- **THEN** the system reports a `store_path_outside_project` error
-- **AND** does not create a project-scoped registry entry
+#### Scenario: Absolute and parent paths are accepted
+- **WHEN** `.openspec-store/registry.yaml` maps a store ID to an absolute path (e.g. `/home/me/store`) or a parent-relative path (e.g. `../platform-specs`)
+- **THEN** the system resolves the store root without error
+- **AND** does not restrict paths to within the project directory
 
 ### Requirement: Project-scoped registry file format
 
-The system SHALL accept a YAML file with a `version` field and a `stores` map where each store entry maps a store ID to a path relative to the registry file's directory.
+The system SHALL accept a YAML file with a `version` field and a `stores` map where each store entry maps a store ID to a path relative to the directory containing `.openspec-store/`.
 
 #### Scenario: Valid registry file
 - **WHEN** `.openspec-store/registry.yaml` contains:
@@ -196,9 +194,9 @@ The system SHALL apply the discovery walk to `openspec store list --scope projec
 #### Scenario: List shows all registries in the chain
 - **WHEN** `store list --scope project` is run from a nested directory
 - **AND** `.openspec-store/registry.yaml` exists at both the nested level and an ancestor level
-- **THEN** the list includes entries from every registry in the chain
+- **THEN** the list includes entries from every registry in the chain, nearest first
 - **AND** each entry carries the directory of the registry that owns it
-- **AND** when the same store ID appears in multiple registries, the list marks which entry wins for resolution
+- **AND** when the same store ID appears in multiple registries, the first entry in the list is the one that wins resolution
 
 #### Scenario: List from a directory with no registry
 - **WHEN** `store list --scope project` is run from a directory with no `.openspec-store/registry.yaml` in it or any ancestor
@@ -236,6 +234,34 @@ The system SHALL apply the discovery walk to `openspec store list --scope projec
 - **WHEN** `store doctor <id> --scope project` is run from a nested directory
 - **AND** the id is registered only in an ancestor registry
 - **THEN** doctor inspects the store from the ancestor registry
+
+#### Scenario: Store list shows entries with missing folders as a warning
+- **WHEN** `store list --scope project` is run
+- **AND** a store entry points to a folder that does not exist on disk
+- **THEN** the list includes the entry with a warning indicating the folder is missing
+- **AND** the command completes successfully
+
+#### Scenario: Doctor reports an unusable store entry without stopping
+- **WHEN** `store doctor --scope project` is run
+- **AND** a store entry points to a folder that does not exist on disk
+- **THEN** doctor reports the problem and a pasteable fix for that entry
+- **AND** continues inspecting remaining entries
+
+#### Scenario: Unregister succeeds when the store folder is missing
+- **WHEN** `store unregister <id> --scope project` is run
+- **AND** the id is found in a project-scoped registry
+- **AND** the store folder does not exist on disk
+- **THEN** the system removes the registry entry
+- **AND** reports a warning that the folder was not found
+- **AND** the command completes successfully
+
+#### Scenario: Remove is refused when the store folder is missing
+- **WHEN** `store remove <id> --scope project` is run
+- **AND** the id is found in a project-scoped registry
+- **AND** the store folder does not exist on disk
+- **THEN** the system reports an error that the folder is missing
+- **AND** does not remove the registry entry
+- **AND** does not delete any files
 
 ### Requirement: Project-scoped remove requires confirmation
 
